@@ -18,31 +18,65 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'negative'>('all');
   const [sortField, setSortField] = useState<SortField>('created_at' as SortField);
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [currentPage, setCurrentPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
   const itemsPerPage = 10;
 
   useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchTerm);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
+
+  useEffect(() => {
     loadProducts();
-  }, [refreshTrigger]);
+  }, [refreshTrigger, debouncedSearch, stockFilter, sortField, sortDirection, currentPage]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchTerm, stockFilter]);
+  }, [debouncedSearch, stockFilter]);
 
   async function loadProducts() {
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      let query = supabase
         .from('products')
-        .select('*')
-        .eq('is_deleted', false)
-        .order('created_at', { ascending: false });
+        .select('*', { count: 'exact' })
+        .eq('is_deleted', false);
+
+      // Search
+      if (debouncedSearch) {
+        query = query.or(`name.ilike.%${debouncedSearch}%,sku.ilike.%${debouncedSearch}%`);
+      }
+
+      // Stock Filters
+      if (stockFilter === 'low') {
+        // We can't easily join the min_stock_level logic in a single query if it's dynamic
+        // but for now we'll use a fixed threshold or the column if available in a more complex query
+        // For simplicity and correctness with Supabase filter:
+        query = query.lt('current_stock', 10).gte('current_stock', 0);
+      } else if (stockFilter === 'negative') {
+        query = query.lt('current_stock', 0);
+      }
+
+      // Sorting
+      query = query.order(sortField, { ascending: sortDirection === 'asc' });
+
+      // Pagination
+      const from = (currentPage - 1) * itemsPerPage;
+      const to = from + itemsPerPage - 1;
+      query = query.range(from, to);
+
+      const { data, count, error } = await query;
 
       if (error) throw error;
       setProducts(data || []);
+      setTotalCount(count || 0);
     } catch (error) {
       console.error('Error loading products:', error);
     } finally {
@@ -59,48 +93,14 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
     }
   };
 
-  let filteredProducts = products.filter(p =>
-    p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    p.sku.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-
-  if (stockFilter === 'low') {
-    filteredProducts = filteredProducts.filter(p =>
-      p.current_stock < (p.min_stock_level || 10) && p.current_stock >= 0
-    );
-  } else if (stockFilter === 'negative') {
-    filteredProducts = filteredProducts.filter(p => p.current_stock < 0);
-  }
-
-  filteredProducts.sort((a, b) => {
-    let aValue = a[sortField];
-    let bValue = b[sortField];
-
-    if (aValue === null) aValue = 0;
-    if (bValue === null) bValue = 0;
-
-    if (typeof aValue === 'string' && typeof bValue === 'string') {
-      return sortDirection === 'asc'
-        ? aValue.localeCompare(bValue)
-        : bValue.localeCompare(aValue);
-    }
-
-    if (typeof aValue === 'number' && typeof bValue === 'number') {
-      return sortDirection === 'asc' ? aValue - bValue : bValue - aValue;
-    }
-
-    return 0;
-  });
-
-  const totalPages = Math.ceil(filteredProducts.length / itemsPerPage);
-  const startIndex = (currentPage - 1) * itemsPerPage;
-  const paginatedProducts = filteredProducts.slice(startIndex, startIndex + itemsPerPage);
-
   const calculateInventoryValue = (product: Product) => {
     return product.current_stock * product.fixed_cost_usd;
   };
 
-  if (loading) {
+  const totalPages = Math.ceil(totalCount / itemsPerPage);
+  const startIndex = (currentPage - 1) * itemsPerPage;
+
+  if (loading && products.length === 0) {
     return (
       <div className="flex items-center justify-center py-12">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-slate-900"></div>
@@ -124,38 +124,40 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
         <div className="flex gap-2">
           <button
             onClick={() => setStockFilter('all')}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              stockFilter === 'all'
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${stockFilter === 'all'
                 ? 'bg-slate-900 text-white'
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-            }`}
+              }`}
           >
             Tümü
           </button>
           <button
             onClick={() => setStockFilter('low')}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              stockFilter === 'low'
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${stockFilter === 'low'
                 ? 'bg-amber-600 text-white'
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-            }`}
+              }`}
           >
             Düşük Stok
           </button>
           <button
             onClick={() => setStockFilter('negative')}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              stockFilter === 'negative'
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${stockFilter === 'negative'
                 ? 'bg-red-600 text-white'
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-            }`}
+              }`}
           >
             Negatif
           </button>
         </div>
       </div>
 
-      <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+      <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden relative">
+        {loading && (
+          <div className="absolute inset-0 bg-white/50 flex items-center justify-center z-10">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-slate-900"></div>
+          </div>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead className="bg-slate-50 border-b border-slate-200">
@@ -212,14 +214,14 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200">
-              {paginatedProducts.length === 0 ? (
+              {products.length === 0 && !loading ? (
                 <tr>
                   <td colSpan={7} className="px-4 sm:px-6 py-8 text-center text-slate-500">
                     {searchTerm || stockFilter !== 'all' ? 'Filtre kriterlerine uygun ürün bulunamadı' : 'Ürün bulunamadı'}
                   </td>
                 </tr>
               ) : (
-                paginatedProducts.map((product) => {
+                products.map((product) => {
                   const inventoryValue = calculateInventoryValue(product);
                   const minStock = product.min_stock_level || 10;
                   const isLowStock = product.current_stock < minStock;
@@ -230,9 +232,8 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
                       <td className="px-4 sm:px-6 py-4 text-sm font-medium text-slate-900">{product.sku}</td>
                       <td className="px-4 sm:px-6 py-4 text-sm text-slate-700">{product.name}</td>
                       <td className="px-4 sm:px-6 py-4 text-sm text-right">
-                        <span className={`inline-flex items-center gap-1 font-medium ${
-                          isNegative ? 'text-red-600' : isLowStock ? 'text-amber-600' : 'text-slate-900'
-                        }`}>
+                        <span className={`inline-flex items-center gap-1 font-medium ${isNegative ? 'text-red-600' : isLowStock ? 'text-amber-600' : 'text-slate-900'
+                          }`}>
                           {isNegative && <AlertCircle className="h-4 w-4" />}
                           {product.current_stock.toFixed(2)}
                         </span>
@@ -283,7 +284,7 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
       {totalPages > 1 && (
         <div className="flex items-center justify-between bg-white rounded-lg shadow-sm border border-slate-200 px-4 py-3">
           <div className="text-sm text-slate-600">
-            {startIndex + 1}-{Math.min(startIndex + itemsPerPage, filteredProducts.length)} / {filteredProducts.length} ürün
+            {startIndex + 1}-{Math.min(startIndex + itemsPerPage, totalCount)} / {totalCount} ürün
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -308,24 +309,15 @@ export default function ProductList({ onEditProduct, onStockMove, refreshTrigger
       )}
 
       <div className="bg-slate-50 rounded-lg p-4 border border-slate-200">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-center">
           <div>
-            <p className="text-sm text-slate-600">Toplam Ürün</p>
-            <p className="text-2xl font-bold text-slate-900">{filteredProducts.length}</p>
+            <p className="text-sm text-slate-600">Bu Sayfadaki Toplam Ürün</p>
+            <p className="text-2xl font-bold text-slate-900">{products.length}</p>
           </div>
           <div>
-            <p className="text-sm text-slate-600">Toplam Stok Değeri</p>
+            <p className="text-sm text-slate-600">Bu Sayfadaki Stok Değeri</p>
             <p className="text-2xl font-bold text-slate-900">
-              ${filteredProducts.reduce((sum, p) => sum + calculateInventoryValue(p), 0).toFixed(2)}
-            </p>
-          </div>
-          <div>
-            <p className="text-sm text-slate-600">Düşük Stok Uyarısı</p>
-            <p className="text-2xl font-bold text-amber-600">
-              {filteredProducts.filter(p => {
-                const minStock = p.min_stock_level || 10;
-                return p.current_stock < minStock && p.current_stock >= 0;
-              }).length}
+              ${products.reduce((sum, p) => sum + calculateInventoryValue(p), 0).toFixed(2)}
             </p>
           </div>
         </div>

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
 import { X, Upload, FileText, AlertCircle } from 'lucide-react';
+import { logError } from '../lib/activityLogger';
 
 interface BulkImportModalProps {
   onClose: () => void;
@@ -18,7 +19,6 @@ interface ImportRow {
 
 export default function BulkImportModal({ onClose, onSuccess }: BulkImportModalProps) {
   const { user, currentOrgId } = useAuth();
-  const [csvData, setCsvData] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [preview, setPreview] = useState<ImportRow[]>([]);
@@ -30,7 +30,6 @@ export default function BulkImportModal({ onClose, onSuccess }: BulkImportModalP
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = event.target?.result as string;
-      setCsvData(text);
       parseCSV(text);
     };
     reader.readAsText(file);
@@ -83,54 +82,26 @@ export default function BulkImportModal({ onClose, onSuccess }: BulkImportModalP
         name: row.name,
         current_stock: parseFloat(row.stock) || 0,
         fixed_cost_usd: parseFloat(row.cost) || 0,
-        list_price_usd: row.price ? parseFloat(row.price) : null,
-        organization_id: currentOrgId
+        list_price_usd: row.price ? parseFloat(row.price) : null
       }));
 
-      const { data: insertedProducts, error: insertError } = await supabase
-        .from('products')
-        .insert(productsToInsert)
-        .select();
+      const { error: rpcError } = await supabase.rpc('bulk_create_products', {
+        p_products: productsToInsert,
+        p_org_id: currentOrgId,
+        p_user_id: user?.id || ''
+      });
 
-      if (insertError) throw insertError;
-
-      if (insertedProducts) {
-        const transactions = insertedProducts
-          .filter(p => p.current_stock !== 0)
-          .map(p => ({
-            product_id: p.product_id,
-            user_id: user?.id,
-            organization_id: currentOrgId,
-            type: 'ADJUST' as const,
-            quantity: p.current_stock,
-            reason_code: 'BULK_IMPORT'
-          }));
-
-        if (transactions.length > 0) {
-          const { error: txError } = await supabase
-            .from('transactions')
-            .insert(transactions);
-
-          if (txError) console.error('Transaction error:', txError);
-        }
-
-        await supabase
-          .from('user_activity_logs')
-          .insert({
-            user_id: user?.id,
-            organization_id: currentOrgId,
-            action: 'BULK_IMPORT',
-            payload: {
-              count: insertedProducts.length,
-              products: productsToInsert.map(p => p.sku)
-            }
-          });
-      }
+      if (rpcError) throw rpcError;
 
       onSuccess();
       onClose();
     } catch (err: any) {
       console.error('Import error:', err);
+      if (currentOrgId) {
+        await logError(currentOrgId, 'bulk_import_error', err, {
+          previewCount: preview.length
+        });
+      }
       if (err.code === '23505') {
         setError('Bazı SKU\'lar zaten mevcut. Lütfen dosyanızı kontrol edin.');
       } else {

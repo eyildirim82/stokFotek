@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
-import { logActivity } from '../lib/activityLogger';
+import { logActivity, logError } from '../lib/activityLogger';
 import { X, Package } from 'lucide-react';
 import type { Database } from '../lib/database.types';
 
@@ -64,9 +64,13 @@ export default function ProductModal({ product, onClose, onSuccess }: ProductMod
       };
 
       if (product) {
+        // For existing products, we update basic info but NOT stock directly
+        // Stock should be managed via Stock Operations tab for audit trail
+        const { sku, current_stock, ...updateData } = data;
+
         const { error: updateError } = await supabase
           .from('products')
-          .update(data)
+          .update(updateData as any)
           .eq('product_id', product.product_id);
 
         if (updateError) throw updateError;
@@ -74,44 +78,35 @@ export default function ProductModal({ product, onClose, onSuccess }: ProductMod
         if (currentOrgId) {
           await logActivity(currentOrgId, 'update', 'product', product.product_id, {
             sku: product.sku,
-            changes: data
+            changes: updateData
           });
         }
       } else {
-        const { data: newProduct, error: insertError } = await supabase
-          .from('products')
-          .insert(data)
-          .select()
-          .single();
+        // Atomic creation with initial stock and transaction
+        const { error: rpcError } = await supabase.rpc('create_product_with_stock', {
+          p_sku: data.sku,
+          p_name: data.name,
+          p_fixed_cost_usd: data.fixed_cost_usd,
+          p_list_price_usd: data.list_price_usd || 0,
+          p_min_stock_level: data.min_stock_level,
+          p_current_stock: data.current_stock,
+          p_org_id: currentOrgId || '',
+          p_user_id: user?.id || ''
+        });
 
-        if (insertError) throw insertError;
-
-        if (newProduct && parseFloat(formData.current_stock) !== 0) {
-          await supabase
-            .from('transactions')
-            .insert({
-              product_id: newProduct.product_id,
-              user_id: user?.id,
-              type: 'ADJUST',
-              quantity: parseFloat(formData.current_stock),
-              reason_code: 'INITIAL_STOCK',
-              organization_id: currentOrgId
-            });
-        }
-
-        if (currentOrgId && newProduct) {
-          await logActivity(currentOrgId, 'create', 'product', newProduct.product_id, {
-            sku: data.sku,
-            name: data.name,
-            initial_stock: parseFloat(formData.current_stock)
-          });
-        }
+        if (rpcError) throw rpcError;
       }
 
       onSuccess();
       onClose();
     } catch (err: any) {
       console.error('Error:', err);
+      if (currentOrgId) {
+        await logError(currentOrgId, 'product_management_error', err, {
+          action: product ? 'update' : 'create',
+          sku: formData.sku
+        });
+      }
       if (err.code === '23505') {
         setError('Bu SKU zaten kullanılıyor');
       } else {
@@ -236,21 +231,26 @@ export default function ProductModal({ product, onClose, onSuccess }: ProductMod
             <p className="mt-1 text-xs text-slate-500">Bu seviyenin altında stok uyarısı gösterilir</p>
           </div>
 
-          {!product && (
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">
-                Başlangıç Stok Miktarı
-              </label>
-              <input
-                type="number"
-                step="0.01"
-                value={formData.current_stock}
-                onChange={(e) => setFormData({ ...formData, current_stock: e.target.value })}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900"
-                placeholder="0.00"
-              />
-            </div>
-          )}
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">
+              {product ? 'Mevcut Stok Miktarı' : 'Başlangıç Stok Miktarı'}
+            </label>
+            <input
+              type="number"
+              step="0.01"
+              value={formData.current_stock}
+              onChange={(e) => setFormData({ ...formData, current_stock: e.target.value })}
+              className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+              placeholder="0.00"
+              disabled={!!product}
+              title={product ? "Stok miktarını değiştirmek için lütfen 'Stok İşlemleri' sekmesini kullanın." : ""}
+            />
+            {product && (
+              <p className="mt-1 text-xs text-slate-500 italic">
+                Stok değişimi için 'Stok İşlemleri' sekmesini kullanın.
+              </p>
+            )}
+          </div>
 
           {error && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg">

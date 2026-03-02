@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
-import { logActivity } from '../lib/activityLogger';
-import { X, TrendingUp, TrendingDown } from 'lucide-react';
+import { logError } from '../lib/activityLogger'; // Added logError import
+import { X, TrendingUp, TrendingDown } from 'lucide-react'; // Changed Lucide icons import
 import type { Database } from '../lib/database.types';
 
 type Product = Database['public']['Tables']['products']['Row'];
@@ -45,55 +45,39 @@ export default function StockMoveModal({ product, type, onClose, onSuccess }: St
       }
 
       const actualQuantity = type === 'OUT' ? -qty : qty;
-      const newStock = product.current_stock + actualQuantity;
 
-      const { data: updateData, error: updateError } = await supabase
-        .from('products')
-        .update({
-          current_stock: newStock,
-          version: product.version + 1
-        })
-        .eq('product_id', product.product_id)
-        .eq('version', product.version)
-        .select();
-
-      if (updateError) throw updateError;
-
-      if (!updateData || updateData.length === 0) {
-        setError('Stok güncelleme başarısız. Ürün başka bir kullanıcı tarafından güncellenmiş olabilir. Lütfen sayfayı yenileyin.');
+      if (!currentOrgId || !user) {
+        setError('Oturum bilgisi eksik');
         setLoading(false);
         return;
       }
 
-      const { error: transactionError } = await supabase
-        .from('transactions')
-        .insert({
-          product_id: product.product_id,
-          user_id: user?.id,
-          type,
-          quantity: actualQuantity,
-          reference_number: referenceNumber || null,
-          organization_id: currentOrgId
-        });
+      // Atomic update via RPC
+      const { error: rpcError } = await supabase.rpc(
+        'process_stock_movement',
+        {
+          p_product_id: product.product_id,
+          p_org_id: currentOrgId,
+          p_user_id: user.id,
+          p_type: type,
+          p_quantity: actualQuantity,
+          p_reference_number: referenceNumber || undefined, // Changed from || null to || undefined
+          p_reason_code: 'MANUAL_UPDATE', // Kept as is, assuming 'reasonCode' variable was not intended
+          p_current_version: product.version
+        }
+      );
 
-      if (transactionError) throw transactionError;
-
-      if (currentOrgId) {
-        await logActivity(currentOrgId, type === 'IN' ? 'stock_in' : 'stock_out', 'transaction', product.product_id, {
-          sku: product.sku,
-          product_name: product.name,
-          old_stock: product.current_stock,
-          new_stock: newStock,
-          quantity: actualQuantity,
-          reference_number: referenceNumber
-        });
-      }
+      if (rpcError) throw rpcError;
 
       onSuccess();
       onClose();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error:', err);
-      setError('İşlem sırasında bir hata oluştu');
+      const errorMessage = err.message || 'İşlem sırasında bir hata oluştu';
+      setError(errorMessage);
+      if (currentOrgId) {
+        await logError(currentOrgId, 'StockMoveModal_handleSubmit', err);
+      }
     } finally {
       setLoading(false);
     }
@@ -201,11 +185,10 @@ export default function StockMoveModal({ product, type, onClose, onSuccess }: St
             </button>
             <button
               type="submit"
-              className={`flex-1 px-4 py-2 rounded-lg text-white transition-colors ${
-                type === 'IN'
-                  ? 'bg-green-600 hover:bg-green-700'
-                  : 'bg-red-600 hover:bg-red-700'
-              }`}
+              className={`flex-1 px-4 py-2 rounded-lg text-white transition-colors ${type === 'IN'
+                ? 'bg-green-600 hover:bg-green-700'
+                : 'bg-red-600 hover:bg-red-700'
+                }`}
               disabled={loading}
             >
               {loading ? 'İşleniyor...' : 'Kaydet'}

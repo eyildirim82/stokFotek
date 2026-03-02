@@ -55,77 +55,41 @@ Deno.serve(async (req: Request) => {
       throw new Error("Missing required fields");
     }
 
-    const { data: product, error: productError } = await supabaseClient
-      .from("products")
-      .select("*")
-      .eq("product_id", product_id)
+    // 1. Get user's organization (Enforce multi-tenant boundary)
+    const { data: userRole, error: roleError } = await supabaseClient
+      .from("user_roles")
+      .select("organization_id")
+      .eq("user_id", user.id)
       .single();
 
-    if (productError || !product) {
-      throw new Error("Product not found");
+    if (roleError || !userRole) {
+      throw new Error("User has no assigned organization or access denied");
     }
 
-    const actualQuantity = type === "OUT" ? -Math.abs(quantity) : Math.abs(quantity);
-    const newStock = product.current_stock + actualQuantity;
+    // 2. Process stock movement using the atomic RPC function
+    // This ensures that the product belongs to the user's organization
+    // and that the update is atomic.
+    const { data: rpcResult, error: rpcError } = await supabaseClient.rpc(
+      "process_stock_movement",
+      {
+        p_product_id: product_id,
+        p_org_id: userRole.organization_id,
+        p_user_id: user.id,
+        p_type: type,
+        p_quantity: type === "OUT" ? -Math.abs(quantity) : Math.abs(quantity),
+        p_reference_number: reference_number || null,
+        p_reason_code: reason_code || "EDGE_FUNCTION",
+      }
+    );
 
-    const { error: updateError } = await supabaseClient
-      .from("products")
-      .update({
-        current_stock: newStock,
-        version: product.version + 1,
-      })
-      .eq("product_id", product_id)
-      .eq("version", product.version);
-
-    if (updateError) {
-      throw new Error("Failed to update stock (concurrent modification)");
+    if (rpcError) {
+      throw new Error(`Stock processing failed: ${rpcError.message}`);
     }
-
-    const { error: transactionError } = await supabaseClient
-      .from("transactions")
-      .insert({
-        product_id,
-        user_id: user.id,
-        type,
-        quantity: actualQuantity,
-        reference_number: reference_number || null,
-        reason_code: reason_code || null,
-      });
-
-    if (transactionError) {
-      await supabaseClient
-        .from("products")
-        .update({
-          current_stock: product.current_stock,
-          version: product.version,
-        })
-        .eq("product_id", product_id);
-
-      throw new Error("Failed to create transaction");
-    }
-
-    await supabaseClient.from("activity_log").insert({
-      user_id: user.id,
-      action: `STOCK_${type}`,
-      payload: {
-        product_id,
-        sku: product.sku,
-        old_stock: product.current_stock,
-        new_stock: newStock,
-        quantity: actualQuantity,
-        reference_number,
-        reason_code,
-      },
-    });
 
     return new Response(
       JSON.stringify({
         success: true,
-        data: {
-          old_stock: product.current_stock,
-          new_stock: newStock,
-          quantity: actualQuantity,
-        },
+        data: rpcResult,
       }),
       {
         headers: {

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
 import { Clock, Activity, Filter, Download } from 'lucide-react';
+import { logError } from '../lib/activityLogger';
 import type { Database } from '../lib/database.types';
 
 type ActivityLog = Database['public']['Tables']['user_activity_logs']['Row'] & {
@@ -17,64 +18,106 @@ export default function ActivityLogs() {
   const [filterAction, setFilterAction] = useState<string>('ALL');
   const [dateRange, setDateRange] = useState({ start: '', end: '' });
 
+  // Pagination State
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize] = useState(25);
+  const [totalCount, setTotalCount] = useState(0);
+
   const canViewLogs = userRole === 'admin' || userRole === 'manager';
 
   useEffect(() => {
     if (currentOrgId && canViewLogs) {
       loadLogs();
     }
-  }, [currentOrgId, canViewLogs]);
+  }, [currentOrgId, canViewLogs, filterAction, dateRange.start, dateRange.end, currentPage]);
 
   async function loadLogs() {
     if (!currentOrgId || !canViewLogs) return;
 
     setLoading(true);
     try {
-      const { data, error } = await supabase
+      const from = (currentPage - 1) * pageSize;
+      const to = from + pageSize - 1;
+
+      let query = supabase
         .from('user_activity_logs')
         .select(`
           *,
           user_profiles!user_activity_logs_user_id_fkey (full_name)
-        `)
-        .eq('organization_id', currentOrgId)
+        `, { count: 'exact' })
+        .eq('organization_id', currentOrgId);
+
+      if (filterAction !== 'ALL') {
+        query = query.eq('action', filterAction);
+      }
+
+      if (dateRange.start) {
+        query = query.gte('created_at', dateRange.start);
+      }
+
+      if (dateRange.end) {
+        query = query.lte('created_at', `${dateRange.end}T23:59:59`);
+      }
+
+      const { data, error, count } = await query
         .order('created_at', { ascending: false })
-        .limit(500);
+        .range(from, to);
 
       if (error) throw error;
       setLogs((data as any[]) || []);
+      setTotalCount(count || 0);
     } catch (error) {
       console.error('Error loading activity logs:', error);
+      if (currentOrgId) {
+        await logError(currentOrgId, 'ActivityLogs_loadLogs', error);
+      }
     } finally {
       setLoading(false);
     }
   }
 
-  const filteredLogs = logs.filter(log => {
-    if (filterAction !== 'ALL' && log.action !== filterAction) return false;
-    if (dateRange.start && log.created_at && new Date(log.created_at).getTime() < new Date(dateRange.start).getTime()) return false;
-    if (dateRange.end && log.created_at && new Date(log.created_at).getTime() > new Date(dateRange.end + 'T23:59:59').getTime()) return false;
-    return true;
-  });
+  const exportToCSV = async () => {
+    try {
+      if (!currentOrgId) return;
+      let query = supabase
+        .from('user_activity_logs')
+        .select(`
+          created_at,
+          action,
+          details,
+          user_profiles!user_activity_logs_user_id_fkey (full_name)
+        `)
+        .eq('organization_id', currentOrgId)
+        .limit(1000);
 
-  const exportToCSV = () => {
-    const headers = ['Tarih & Saat', 'Kullanıcı', 'İşlem', 'Detaylar'];
-    const rows = filteredLogs.map(log => [
-      log.created_at ? new Date(log.created_at).toLocaleString('tr-TR') : '---',
-      log.user_profiles?.full_name || 'Bilinmiyor',
-      getActionLabel(log.action),
-      JSON.stringify(log.details)
-    ]);
+      if (filterAction !== 'ALL') query = query.eq('action', filterAction);
+      if (dateRange.start) query = query.gte('created_at', dateRange.start);
+      if (dateRange.end) query = query.lte('created_at', `${dateRange.end}T23:59:59`);
 
-    const csvContent = [
-      headers.join(','),
-      ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
-    ].join('\n');
+      const { data, error } = await query.order('created_at', { ascending: false });
+      if (error) throw error;
 
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `aktivite-kayitlari-${new Date().toISOString().split('T')[0]}.csv`;
-    link.click();
+      const headers = ['Tarih & Saat', 'Kullanıcı', 'İşlem', 'Detaylar'];
+      const rows = (data || []).map(log => [
+        log.created_at ? new Date(log.created_at).toLocaleString('tr-TR') : '---',
+        (log as any).user_profiles?.full_name || 'Bilinmiyor',
+        getActionLabel(log.action || ''),
+        JSON.stringify(log.details)
+      ]);
+
+      const csvContent = [
+        headers.join(','),
+        ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
+      ].join('\n');
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `aktivite-kayitlari-${new Date().toISOString().split('T')[0]}.csv`;
+      link.click();
+    } catch (err) {
+      console.error('CSV export failed:', err);
+    }
   };
 
   const getActionLabel = (action: string) => {
@@ -86,7 +129,9 @@ export default function ActivityLogs() {
       'stock_out': 'Stok Çıkışı',
       'BULK_IMPORT': 'Toplu İçe Aktarma',
       'login': 'Giriş',
-      'logout': 'Çıkış'
+      'logout': 'Çıkış',
+      'legacy_system': 'Eski Sistem Kaydı',
+      'system_error': 'Sistem Hatası'
     };
     return labels[action] || action;
   };
@@ -95,6 +140,8 @@ export default function ActivityLogs() {
     if (action.includes('create') || action.includes('stock_in')) return 'text-green-600 bg-green-50';
     if (action.includes('delete') || action.includes('stock_out')) return 'text-red-600 bg-red-50';
     if (action.includes('update')) return 'text-blue-600 bg-blue-50';
+    if (action === 'system_error') return 'text-red-700 bg-red-100 border border-red-200';
+    if (action === 'legacy_system') return 'text-amber-700 bg-amber-50 border border-amber-100';
     return 'text-slate-600 bg-slate-50';
   };
 
@@ -112,13 +159,7 @@ export default function ActivityLogs() {
     );
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-slate-900"></div>
-      </div>
-    );
-  }
+  const totalPages = Math.ceil(totalCount / pageSize);
 
   return (
     <div className="space-y-4">
@@ -130,7 +171,10 @@ export default function ActivityLogs() {
             </label>
             <select
               value={filterAction}
-              onChange={(e) => setFilterAction(e.target.value)}
+              onChange={(e) => {
+                setFilterAction(e.target.value);
+                setCurrentPage(1);
+              }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
             >
               <option value="ALL">Tümü</option>
@@ -140,6 +184,7 @@ export default function ActivityLogs() {
               <option value="stock_in">Stok Girişi</option>
               <option value="stock_out">Stok Çıkışı</option>
               <option value="BULK_IMPORT">Toplu İçe Aktarma</option>
+              <option value="legacy_system">Eski Sistem Kaydı</option>
             </select>
           </div>
 
@@ -150,7 +195,10 @@ export default function ActivityLogs() {
             <input
               type="date"
               value={dateRange.start}
-              onChange={(e) => setDateRange({ ...dateRange, start: e.target.value })}
+              onChange={(e) => {
+                setDateRange({ ...dateRange, start: e.target.value });
+                setCurrentPage(1);
+              }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
             />
           </div>
@@ -162,7 +210,10 @@ export default function ActivityLogs() {
             <input
               type="date"
               value={dateRange.end}
-              onChange={(e) => setDateRange({ ...dateRange, end: e.target.value })}
+              onChange={(e) => {
+                setDateRange({ ...dateRange, end: e.target.value });
+                setCurrentPage(1);
+              }}
               className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
             />
           </div>
@@ -171,14 +222,14 @@ export default function ActivityLogs() {
         <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-200">
           <div className="flex items-center gap-2 text-sm text-slate-600">
             <Filter className="h-4 w-4" />
-            <span>{filteredLogs.length} kayıt gösteriliyor</span>
+            <span>Toplam {totalCount} kayıt, {logs.length} kayıt gösteriliyor</span>
           </div>
           <button
             onClick={exportToCSV}
             className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 text-white text-sm rounded-lg hover:bg-slate-800 transition-colors"
           >
             <Download className="h-4 w-4" />
-            CSV İndir
+            CSV İndir (Max 1000)
           </button>
         </div>
       </div>
@@ -194,15 +245,20 @@ export default function ActivityLogs() {
                 <th className="px-6 py-3 text-left text-xs font-semibold text-slate-700 uppercase tracking-wider">Detaylar</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200">
-              {filteredLogs.length === 0 ? (
+            <tbody className="divide-y divide-slate-200 relative">
+              {loading && (
+                <div className="absolute inset-0 bg-white/30 flex items-center justify-center z-10">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-slate-900"></div>
+                </div>
+              )}
+              {logs.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="px-6 py-8 text-center text-slate-500">
-                    Aktivite kaydı bulunamadı
+                    {loading ? 'Yükleniyor...' : 'Aktivite kaydı bulunamadı'}
                   </td>
                 </tr>
               ) : (
-                filteredLogs.map((log) => (
+                logs.map((log) => (
                   <tr key={(log as any).id || (log as any).log_id} className="hover:bg-slate-50 transition-colors">
                     <td className="px-6 py-4 text-sm text-slate-700">
                       <div className="flex items-center gap-2">
@@ -241,6 +297,29 @@ export default function ActivityLogs() {
             </tbody>
           </table>
         </div>
+
+        {/* Pagination Controls */}
+        {totalPages > 1 && (
+          <div className="px-6 py-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between">
+            <button
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={currentPage === 1 || loading}
+              className="px-3 py-1 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-50 transition-colors shadow-sm"
+            >
+              Önceki
+            </button>
+            <span className="text-sm text-slate-600">
+              Sayfa <span className="font-semibold text-slate-900">{currentPage}</span> / {totalPages}
+            </span>
+            <button
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={currentPage === totalPages || loading}
+              className="px-3 py-1 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 disabled:opacity-50 transition-colors shadow-sm"
+            >
+              Sonraki
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

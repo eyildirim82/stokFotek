@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { Users, UserPlus, X, Shield, Eye, Briefcase, Package } from 'lucide-react';
+import { logActivity } from '../lib/activityLogger';
 
 interface UserRole {
   id: string;
@@ -107,6 +108,10 @@ export default function UserManagement({ organizationId, currentUserRole }: User
         }
       } else {
         await loadUserRoles();
+        await logActivity(organizationId, 'create', 'user_role', userData.id, {
+          email: newUserEmail,
+          role: newUserRole
+        });
         setShowAddUser(false);
         setNewUserEmail('');
         setNewUserRole('viewer');
@@ -131,6 +136,7 @@ export default function UserManagement({ organizationId, currentUserRole }: User
         .eq('id', roleId);
 
       if (error) throw error;
+      await logActivity(organizationId, 'delete', 'user_role', roleId, {});
       await loadUserRoles();
     } catch (error) {
       console.error('Error removing user:', error);
@@ -146,6 +152,7 @@ export default function UserManagement({ organizationId, currentUserRole }: User
         .eq('id', roleId);
 
       if (error) throw error;
+      await logActivity(organizationId, 'update', 'user_role', roleId, { new_role: newRole });
       await loadUserRoles();
     } catch (error) {
       console.error('Error updating role:', error);

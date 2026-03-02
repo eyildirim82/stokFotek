@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
-import { logActivity } from '../lib/activityLogger';
-import { Search, TrendingUp, TrendingDown, ArrowLeftRight, CheckCircle2, AlertCircle, Package, X } from 'lucide-react';
+import { Search, Package, TrendingUp, TrendingDown, ArrowLeftRight, CheckCircle2, AlertCircle, X } from 'lucide-react';
 import type { Database } from '../lib/database.types';
+import { logError } from '../lib/activityLogger';
 
 type Product = Database['public']['Tables']['products']['Row'];
 
@@ -72,47 +72,32 @@ export default function StockOperations() {
             }
 
             const actualQuantity = operationType === 'OUT' ? -qty : qty;
-            const newStock = selectedProduct.current_stock + actualQuantity;
 
-            const { data: updateData, error: updateError } = await (supabase
-                .from('products') as any)
-                .update({
-                    current_stock: newStock,
-                    version: selectedProduct.version + 1
-                })
-                .eq('product_id', selectedProduct.product_id)
-                .eq('version', selectedProduct.version)
-                .select();
-
-            if (updateError) throw updateError;
-
-            if (!updateData || updateData.length === 0) {
-                setStatus({ type: 'error', message: 'Güncelleme başarısız. Ürün verisi değişmiş olabilir.' });
+            if (!currentOrgId || !user) {
+                setStatus({ type: 'error', message: 'Oturum bilgisi eksik' });
                 setLoading(false);
                 return;
             }
 
-            const { error: transactionError } = await supabase
-                .from('transactions')
-                .insert({
-                    product_id: selectedProduct.product_id,
-                    user_id: user?.id,
-                    type: operationType,
-                    quantity: actualQuantity,
-                    reference_number: referenceNumber || null,
-                    organization_id: currentOrgId
-                } as any);
+            // Atomic update via RPC
+            const { data: rpcResult, error: rpcError } = await supabase.rpc(
+                'process_stock_movement',
+                {
+                    p_product_id: selectedProduct.product_id,
+                    p_org_id: currentOrgId,
+                    p_user_id: user.id,
+                    p_type: operationType,
+                    p_quantity: actualQuantity,
+                    p_reference_number: referenceNumber || undefined,
+                    p_reason_code: 'QUICK_OPERATION',
+                    p_current_version: selectedProduct.version
+                }
+            );
 
-            if (transactionError) throw transactionError;
+            if (rpcError) throw rpcError;
 
-            await logActivity(currentOrgId, operationType === 'IN' ? 'stock_in' : 'stock_out', 'transaction', selectedProduct.product_id, {
-                sku: selectedProduct.sku,
-                product_name: selectedProduct.name,
-                old_stock: selectedProduct.current_stock,
-                new_stock: newStock,
-                quantity: actualQuantity,
-                reference_number: referenceNumber
-            });
+            // Type cast the returned data from RPC
+            const result = rpcResult as any;
 
             setStatus({
                 type: 'success',
@@ -124,16 +109,20 @@ export default function StockOperations() {
                 if (!prev) return null;
                 return {
                     ...prev,
-                    current_stock: newStock,
-                    version: prev.version + 1
+                    current_stock: result.new_stock,
+                    version: result.new_version
                 } as Product;
             });
 
             setQuantity('');
             setReferenceNumber('');
-        } catch (err) {
+        } catch (err: any) {
             console.error('Error:', err);
-            setStatus({ type: 'error', message: 'İşlem sırasında bir hata oluştu' });
+            const errorMessage = err.message || 'İşlem sırasında bir hata oluştu';
+            setStatus({ type: 'error', message: errorMessage });
+            if (currentOrgId) {
+                await logError(currentOrgId, 'StockOperations_handleSubmit', err);
+            }
         } finally {
             setLoading(false);
         }
