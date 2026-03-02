@@ -1,5 +1,8 @@
 # Envanter Yönetim Sistemi
 
+> [!IMPORTANT]
+> **Devir Notu:** Bu projenin teknik devir süreçleri, mimari detayları ve AI tarafından optimize edilmiş mantık blokları için [PROJE_DEVIR_DOKUMANTASYONU.md](file:///c:/Users/erkan/stok/PROJE_DEVIR_DOKUMANTASYONU.md) dosyasını inceleyiniz.
+
 Çok organizasyonlu, rol tabanlı yetkilendirme ile güçlendirilmiş kapsamlı envanter yönetim sistemi.
 
 ## Özellikler
